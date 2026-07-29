@@ -1,0 +1,5 @@
+CLEAN
+
+Measures. Reports a count. It admits nothing, refuses nothing, and gates no request.
+It reads block hashes and integers -- never prompt text, completions, or user identity --
+and implements no filed apparatus.
