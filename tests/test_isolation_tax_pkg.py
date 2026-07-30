@@ -144,3 +144,143 @@ def test_the_heuristic_declares_itself_a_heuristic():
 def test_unlabelled_requests_are_refused_not_silently_counted_as_one_tenant():
     with pytest.raises(ValueError, match="tenant on EVERY request"):
         public_share_arm([_r(0, 100, 10, [1, 2])])
+
+
+def test_exact_mode_stays_linear_on_a_hot_shared_block():
+    """The performance property, as a test rather than a benchmark nobody re-runs.
+
+    EXACT mode used to scan every prior TOUCHER of a block to answer "has my tenant been here?".
+    A system-prompt block is touched by every request, so the pass was quadratic: exponent 1.7 at
+    n=20k, and 1M requests did not finish in ten minutes. It now keeps a set of TENANTS per block
+    and answers in O(1).
+
+    This asserts the scaling, not a wall-clock number, so it does not go red on a slow machine.
+
+    FLAKE FIXED 2026-07-29, and the docstring above was overconfident. A *ratio* of two wall-clock
+    timings is still timing-sensitive: run inside the full 917-test suite this went red at ratio > 9
+    while passing 3/3 standalone. Contention inflated the n=16k arm relative to the n=4k arm.
+
+    The threshold is UNCHANGED at 9.0 -- loosening it would have hidden the very regression the test
+    exists to catch. Instead each arm is now the MINIMUM of REPEATS runs. Scheduler contention can
+    only ever make a measurement slower, so the minimum is the least-contaminated estimator of how
+    fast the pass can go, and min-vs-min is the honest comparison. This is the repo's own lesson --
+    gate a count, not a stopwatch -- applied as far as a pure-timing property allows.
+    """
+    import random
+    import time
+
+    REPEATS = 5
+
+    def synth(n, rng):
+        rows = []
+        for i in range(n):
+            chain = [0] + [rng.randrange(50) for _ in range(2)] + [10_000 + i]
+            rows.append({"hash_ids": chain, "input_length": 512 * len(chain),
+                         "output_length": 128, "timestamp": 10.0 * i,
+                         "tenant": f"t{rng.randrange(500)}"})
+        return rows
+
+    timings = []
+    for n in (4_000, 16_000):
+        # Same seed per arm, so both arms see the same generator sequence and the only difference
+        # between them is n. Re-seeding inside the loop keeps repeat k identical to repeat 0.
+        best = None
+        for _ in range(REPEATS):
+            rows = synth(n, random.Random(7))
+            t0 = time.perf_counter()
+            measure(rows)
+            dt = max(time.perf_counter() - t0, 1e-4)
+            best = dt if best is None else min(best, dt)
+        timings.append(best)
+
+    # 4x the input must not cost anywhere near 16x the time. A quadratic pass scores ~16; the
+    # linear one scores ~4. The threshold sits well clear of both so timing noise cannot flip it.
+    ratio = timings[1] / timings[0]
+    assert ratio < 9.0, (
+        f"EXACT mode scaled {ratio:.1f}x for a 4x input (best of {REPEATS}) — the per-hit toucher "
+        f"scan is back, and a provider-sized trace will not finish")
+
+
+# ---------------------------------------------------------------- signoff-cert conformance
+
+def _peer():
+    import os
+    import sys
+    p = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "signoff-cert", "src")
+    if os.path.isdir(p) and p not in sys.path:
+        sys.path.insert(0, p)
+    return pytest.importorskip("signoff_cert", reason="signoff-cert absent; conformance NOT checked")
+
+
+def _arm_and_cert(**kw):
+    from isolation_tax import build_certificate
+    tmpl = [1, 2, 3]
+    rows = [_r(i * 1000, 2048, 50, tmpl + [90 + i], f"t{i}") for i in range(4)]
+    arm = public_share_arm(rows, public_blocks=set(tmpl))
+    return arm, build_certificate(arm, n_requests=len(rows), n_tenants=4, **kw)
+
+
+def test_the_certificate_is_admitted_and_the_bound_recomputes_to_zero():
+    _peer()
+    from signoff_cert.bounds import recompute
+    from signoff_cert.verify import verify_certificate
+    _, cert = _arm_and_cert(hmac_key=b"k" * 32, key_id="test")
+    r = verify_certificate(cert, hmac_key=b"k" * 32)
+    assert r.ok, r.reasons
+    assert r.effective_verdict == "ADMITTED" and r.trust_level == "authenticated"
+    assert recompute(cert) == (0.0, None)
+
+
+def test_a_partial_enumeration_is_refused_by_name():
+    """THE NEGATIVE CONTROL. Drop one request from the count and the 0.0 must stop being valid,
+    or the round-trip above would pass even with the bound check bypassed."""
+    _peer()
+    import json as _json
+
+    from signoff_cert.bounds import recompute
+    _, cert = _arm_and_cert(hmac_key=b"k" * 32)
+    broken = _json.loads(_json.dumps(cert))
+    broken["evidence"]["enumerated"] -= 1
+    value, err = recompute(broken)
+    assert value is None
+    assert err is not None and "partial enumeration" in err
+
+
+def test_a_vacuous_arm_cannot_be_certified():
+    """Zero leaks is not an achievement for a scheme that shares nothing."""
+    from isolation_tax import build_certificate
+    rows = [_r(i * 1000, 2048, 50, [1, 2, 90 + i], f"t{i}") for i in range(3)]
+    with pytest.raises(ValueError, match="VACUOUS"):
+        build_certificate(public_share_arm(rows, public_blocks=set()),
+                          n_requests=3, n_tenants=3)
+
+
+def test_gate_legs_hold_only_conditions_the_verdict_requires():
+    """The reference verifier fails an ADMITTED certificate carrying any false leg. An earlier
+    version put `publicness_caller_supplied` in legs -- metadata, not a safety condition -- and a
+    heuristic-derived run was refused for it."""
+    _peer()
+    _, cert = _arm_and_cert(hmac_key=b"k" * 32)
+    assert all(cert["gate"]["legs"].values()), "an ADMITTED cert must not carry a false leg"
+    assert "publicness_caller_supplied" in cert["evidence"], "metadata belongs in evidence"
+
+
+def test_unsigned_is_self_consistent_and_not_admitted_by_default():
+    _peer()
+    from signoff_cert.verify import verify_certificate
+    _, cert = _arm_and_cert()
+    assert "signature" not in cert
+    assert verify_certificate(cert).ok is False
+    assert verify_certificate(cert).trust_level == "self-consistent"
+    assert verify_certificate(cert, require_authentication=False).ok is True
+
+
+def test_the_scope_stops_zero_being_read_as_a_universal_guarantee():
+    _peer()
+    _, cert = _arm_and_cert(hmac_key=b"k" * 32)
+    scope = cert["confidence"]["scope"]
+    assert "THIS TRACE ONLY" in scope and "never that" in scope
+    joined = " ".join(cert["honesty"]["non_claims"])
+    assert "NOT a guarantee for other traffic" in joined
+    assert "No timing channel is modelled" in joined

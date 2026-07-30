@@ -27,11 +27,19 @@ RELEASED production trace. That is a smaller claim and it is the true one.
 AND A PUBLISHED FIGURE THAT LOOKED LIKE A CONTRADICTION
 -------------------------------------------------------
 arXiv 2605.18825 reports 99.28% of reused blocks in ShareGPT-style traces come from the SAME
-session -- a cross-session share of ~0.72%, against our 11.8% for the same quantity. Ours was the
+session -- a cross-session share of ~0.72%, against our 11.8% for the same quantity
+(results/data/statefabric/isolation_tax.json, registered as isolation_tax_mooncake). Ours was the
 surprising number, so ours had to survive.
 
 It does. `replicate_prior_isolation_results.py` runs this code UNMODIFIED on WildChat-1M, which is
-ShareGPT-shaped consumer chat, and returns 1.4% -- 2.0x the published 0.72%, same order. The same
+ShareGPT-shaped consumer chat. Against the published 0.72% the like-for-like comparator is the
+EXACT cross-session share, 4.19% -- 5.82x, same order
+(results/data/statefabric/isolation_tax_replication.json, verdict.ratio_to_published, registered as
+isolation_tax_replication) (CORRECTED 2026-07-30: this said "1.4% --
+2.0x", which divided by the label-free BOUNDED FLOOR; WildChat has real session labels and the
+published figure is measured with labels, so the floor made agreement look 2.91x tighter than it
+is). The 1.4% BOUNDED floor remains the right number against MOONCAKE, which carries no labels
+and can only be measured label-free. Two questions, two figures -- do not collapse them. The same
 code returns 11.8% on Mooncake, where the mean prompt is 10x longer. The discriminator is not
 inflating anything; the workload differs.
 
@@ -209,7 +217,18 @@ def measure(requests: Iterable[Dict[str, Any] | Request], *,
                      f"BOUNDED. Label every request or none.")
 
     universal = _universal(rs)
+    # EXACT mode asks only "has MY tenant touched this block?", so it keeps a SET of tenants per
+    # block and answers in O(1). The obvious implementation keeps the list of touching REQUESTS and
+    # scans it, which is O(touchers) per hit -- and a system-prompt block is touched by every
+    # request, making the whole pass quadratic. Measured before the fix: exponent 1.7 at n=20k, and
+    # a 1M-request trace did not finish in ten minutes.
+    #
+    # BOUNDED mode genuinely needs the request list, because _can_follow compares against each
+    # candidate ancestor. It stays a list, and stays linear only because its per-block toucher
+    # lists are short (p99 = 7 on the Mooncake trace); the hot system-prompt block is excluded from
+    # the content path by the universal split.
     pool: Dict[Any, list] = defaultdict(list)
+    seen_by: Dict[Any, set] = defaultdict(set)
     total_blocks = total_hits = uni_hits = content_hits = lost = lost_uni = 0
 
     for i, r in enumerate(rs):
@@ -218,11 +237,10 @@ def measure(requests: Iterable[Dict[str, Any] | Request], *,
         while j < len(r.hash_ids) and pool[r.hash_ids[j]]:
             blk = r.hash_ids[j]
             total_hits += 1
-            prior = pool[blk]
             if mode == EXACT:
-                survives = any(rs[t].tenant == r.tenant for t in prior)
+                survives = r.tenant in seen_by[blk]
             else:
-                survives = any(_can_follow(r, rs[t], ms_per_tok) for t in prior)
+                survives = any(_can_follow(r, rs[t], ms_per_tok) for t in pool[blk])
             if blk in universal:
                 uni_hits += 1
                 if not survives:
@@ -234,6 +252,7 @@ def measure(requests: Iterable[Dict[str, Any] | Request], *,
             j += 1
         for b in r.hash_ids:
             pool[b].append(i)
+            seen_by[b].add(r.tenant)
 
     if mode == BOUNDED:
         notes.append("BOUNDED: this is a FLOOR on cross-session sharing, not the tax. The tests "
@@ -310,7 +329,7 @@ def public_share_arm(requests, *, public_blocks=None, min_tenants=None,
 
     def replay(mode: str):
         pool: Dict[Any, list] = defaultdict(list)
-        hits = cross = 0
+        hits = cross = cross_private = 0
         for i, r in enumerate(rs):
             j = 0
             while j < len(r.hash_ids) and pool[r.hash_ids[j]]:
@@ -328,14 +347,20 @@ def public_share_arm(requests, *, public_blocks=None, min_tenants=None,
                 hits += 1
                 if not same:
                     cross += 1
+                    # A cross-tenant hit on a NON-public block is the leak. Under the public rule
+                    # it should be impossible by construction -- `usable` would be False and the
+                    # scan would have stopped. Counted anyway rather than assumed, because "it
+                    # cannot happen" is what a test is for.
+                    if blk not in public:
+                        cross_private += 1
                 j += 1
             for b in r.hash_ids:
                 pool[b].append(i)
-        return hits, cross
+        return hits, cross, cross_private
 
-    g_hits, g_cross = replay("global")
-    i_hits, _ = replay("isolated")
-    p_hits, p_cross = replay("public")
+    g_hits, g_cross, _ = replay("global")
+    i_hits, _, _ = replay("isolated")
+    p_hits, p_cross, p_cross_private = replay("public")
 
     recovered = p_hits - i_hits
     recoverable = g_hits - i_hits
@@ -343,7 +368,10 @@ def public_share_arm(requests, *, public_blocks=None, min_tenants=None,
         "arms": {
             "global": {"hits": g_hits, "cross_tenant_hits": g_cross},
             "isolated": {"hits": i_hits, "cross_tenant_hits": 0},
-            "public_share": {"hits": p_hits, "cross_tenant_hits": p_cross},
+            "public_share": {"hits": p_hits, "cross_tenant_hits": p_cross,
+                             # cross-tenant hits on PUBLIC blocks are the point of the arm; only
+                             # a hit on a private block is a leak.
+                             "cross_tenant_hits_on_private_blocks": p_cross_private},
         },
         "public_blocks": len(public),
         "public_selection": ("caller-supplied" if public_blocks is not None
@@ -354,12 +382,16 @@ def public_share_arm(requests, *, public_blocks=None, min_tenants=None,
         # A cross-tenant hit on a NON-public block would mean the arm leaked. p_cross counts hits
         # that crossed tenants; all of them must be on public blocks by construction, so this is
         # the check that the construction held rather than a restatement of it.
-        "leaked_non_public_hits": 0 if p_cross <= 0 else None,
+        "leaked_non_public_hits": p_cross_private,
         "vacuous": recovered <= 0,
         "verdict": ("VACUOUS — the public arm recovered nothing, so it is indistinguishable from "
                     "full isolation and proves nothing" if recovered <= 0 else
                     f"recovered {recovered:,} of {recoverable:,} isolatable hits "
-                    f"({recovered/recoverable:.1%}) with every cross-tenant hit on a public block"),
+                    f"({recovered/recoverable:.1%}) with "
+                    + ("every cross-tenant hit on a public block"
+                       if p_cross_private == 0 else
+                       f"{p_cross_private:,} LEAKED hits on private blocks — the rule was not "
+                       f"enforced")),
         "honest_limit": ("Publicness came from a HEURISTIC, not a proof: N tenants sending the same "
                          "block may be N victims of one leaked document rather than N users of a "
                          "public template. Supply `public_blocks` for a real guarantee."
