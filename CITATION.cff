@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: If you use this software, please cite it as below.
+title: "isolation-tax: Sharing the KV cache across tenants leaks. Isolating costs you money. How much depends on your workload — published figures span an order of magnitude"
+abstract: >-
+  Sharing the KV cache across tenants leaks. Isolating costs you money. How much depends on your workload — published figures span an order of magnitude
+authors:
+  - family-names: Harris
+    given-names: Nick
+repository-code: "https://github.com/nickharris808/isolation-tax"
+url: "https://github.com/nickharris808/isolation-tax"
+license: Apache-2.0
+type: software
+keywords:
+  - verification
+  - abstention
+  - reproducibility
