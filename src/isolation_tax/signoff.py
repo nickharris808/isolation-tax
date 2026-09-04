@@ -38,7 +38,7 @@ __all__ = ["build_certificate", "SIGNOFF_UNAVAILABLE"]
 SIGNOFF_UNAVAILABLE = (
     "the `signoff-cert` package is not installed, so the certificate cannot be sealed with the "
     "digests its verifier requires. Install it with:\n"
-    "    pip install signoff-cert\n"
+    "    pip install \"signoff-cert @ git+https://github.com/nickharris808/signoff-cert@v1.0.1\"\n"
     "Emitting an unsealed certificate would produce a document that looks verifiable and is not."
 )
 
