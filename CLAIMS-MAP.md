@@ -60,4 +60,4 @@ above a threshold is a fact delivered to a shell, not the claimed actuation.
 It does not isolate anything, and it does not give you the sharing back. A cache-admission gate that
 shares provably-public prefixes across tenants while refusing everything else — carrying a
 machine-checked proof that the partition is sound, and emitting a certificate a relying party
-verifies offline — is a separate, commercially licensed product covered by the drafted claims above.
+verifies offline — is a separate, commercially licensed product and the subject of the drafted claims above.
