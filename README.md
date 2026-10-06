@@ -661,7 +661,7 @@ running `--help` on every published command.
 
 Everything above is **measure-only** and Apache-2.0: it tells you what is true and never acts on
 it. The **enforcement** side — binding a partition key at the admission decision, the compiled gate
-corpus, and the certificate-*issuing* faucet — is covered by filed patents and licensed separately.
+corpus, and the certificate-*issuing* faucet — is licensed separately; patent claims drafted, filing status available on request.
 
 **Reading is free. Enforcing is licensed.**
 <!-- /PORTFOLIO -->
